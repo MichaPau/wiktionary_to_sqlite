@@ -64,26 +64,30 @@ impl Rusqlite {
     }
 
     pub fn receive_entries(mut self, r: Receiver<Vec<Word>>) -> JoinHandle<()> {
-        
+        let mut unique_errors = 0;
+        let mut form_errors = 0;
         let handle = thread::spawn(move || loop {
             match r.recv() {
                 Ok(word_package) => {
-                    self.bulk_insert(&word_package).unwrap();
+                    let (ue, fe) = self.bulk_insert(&word_package).unwrap();
+                    unique_errors += ue;
+                    form_errors += fe;
                     
                 },
                 Err(_e) => {
                     println!("db time: {}", Duration::from_nanos(self.db_time as u64).as_secs_f64());
-                    println!("error: {:?}", _e);
+                    println!("Receiver dropped - we have finished..");
+                    println!("Non unique skipped: {unique_errors}, Form errors: {form_errors}");
                     break;
                 },
                 
             }
         });
-
+        
         handle
     }
 
-    pub fn bulk_insert(&mut self, package: &Vec<Word>) -> Result<(), DbError> {
+    pub fn bulk_insert(&mut self, package: &Vec<Word>) -> Result<(u32, u32), DbError> {
         
         let start = Instant::now();
 
@@ -105,38 +109,55 @@ impl Rusqlite {
             }
         }
 
+        let mut unique_errors = 0;
+        let mut form_errors = 0;
+        
         let tx = self.conn.transaction()?;
         {
+            
             let mut stmt = tx.prepare_cached("INSERT INTO words (word, pos, lang) VALUES (?1, ?2, ?3)")?;
-            let mut stmt2 = tx.prepare_cached("INSERT INTO word_forms (word_form, tag) VALUES (?1, ?2)")?;
+            let mut stmt2 = tx.prepare_cached("INSERT INTO word_forms (word_form, word_id, tag) VALUES (?1, ?2, ?3)")?;
 
             for w in package {
                 let pos_id = self.speech_parts.get(&w.pos).unwrap_or(&0);
                 let lang_id = self.langs.get(&w.lang).unwrap_or(&0);
                 match stmt.execute((&w.word, pos_id, lang_id)) {
-                    Ok(_) => (),
+                    Ok(_) => {
+                        if let Some(forms) = &w.forms {
+                            let word_id = tx.last_insert_rowid();
+                            //println!("word_id: {word_id}");
+                            for f in forms { 
+                                if let Some(tags) = &f.tags {
+                                    for tag in tags {
+                                        match stmt2.execute((&f.form, word_id,  tag)) {
+                                            Ok(_) => (),
+                                            Err(_e) => {
+                                                // println!("Error bulk insert word_form: {:?}", _e);
+                                                // println!("Stmt:{:?}", stmt2.expanded_sql().unwrap());
+                                                form_errors += 1;
+                                            }
+                                        };
+                                    }    
+                                }
+                              
+                           }
+                        }
+                    },
                     Err(_e) => {
-                        // println!("Error bulk insert: {:?}", e);
+                        // println!("Error bulk insert: {:?}", _e);
                         // println!("Stmt:{:?}", stmt.expanded_sql().unwrap());
+                        unique_errors += 1;
                     },
                 }
 
-                if let Some(forms) = &w.forms {
-                    for f in forms { 
-                        if let Some(tags) = &f.tags {
-                            for tag in tags {
-                                stmt2.execute((&f.form, tag))?;
-                            }    
-                        }
-                      
-                   }
-                }
+                
             }
         }
         let r = tx.commit().map_err(|e| DbError::RusqliteError(e));
         self.db_time += start.elapsed().as_nanos();
+        
         match r {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok((unique_errors, form_errors)),
             Err(e) => Err(e),
         }
     }
@@ -219,10 +240,14 @@ impl Rusqlite {
             "CREATE TABLE IF NOT EXISTS word_forms (
                 form_id INTEGER PRIMARY KEY,
                 word_form TEXT NOT NULL,
-                tag TEXT NOT NULL
+				word_id INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                FOREIGN KEY (word_id) REFERENCES words (word_id)
             )", 
             ()
         )?;
+        //word_id INTEGER NOT NULL,
+        //FOREIGN KEY (word_id) REFERENCES words (word_id)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS words (
                 word_id INTEGER PRIMARY KEY,
